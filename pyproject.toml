@@ -13,7 +13,7 @@ dependencies = [
     "setuptools>=80.9.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
-    "torch>=2.8.0",
+    "torch>=2.8.0,<2.9.0",  # 2.9.0+cu128 需要 NVSHMEM
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
 ]
@@ -45,33 +45,65 @@ python_functions = ["test_*"]
 
 # target torch to cuda 12.8 or CPU
 [tool.uv.sources]
-torch = [  
-    { index = "pytorch-cpu", extra = "cpu" },  
-    { index = "pytorch-cu128", extra = "gpu" },  
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu128", extra = "gpu" },
 ]
 
-[[tool.uv.index]]  
-name = "pytorch-cpu"  
-url = "https://download.pytorch.org/whl/cpu"  
-explicit = true  
-  
-[[tool.uv.index]]  
-name = "pytorch-cu128"  
-url = "https://download.pytorch.org/whl/cu128"  
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-[project.optional-dependencies]  
-cpu = [  
-    "torch>=2.8.0",  
-]  
-gpu = [  
-    "torch>=2.8.0",  
-]  
-  
-[tool.uv]  
-conflicts = [  
-    [  
-        { extra = "cpu" },  
-        { extra = "gpu" },  
-    ],  
-]  
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[project.optional-dependencies]
+cpu = [
+    "torch>=2.8.0,<2.9.0",  # 2.9.0+cu128 需要 NVSHMEM
+]
+gpu = [
+    "torch>=2.8.0,<2.9.0",  # 2.9.0+cu128 需要 NVSHMEM
+]
+dev = [
+    "matplotlib>=3.8.0",
+    "scipy>=1.12.0",
+    "pre-commit>=4.0.0,<5.0",
+    "ruff>=0.7.0,<1.0",
+]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "gpu" },
+    ],
+]
+
+# --- [ruff配置] ---
+[tool.ruff]
+# 与项目 Python 版本要求保持一致
+target-version = "py310"
+line-length = 119
+indent-width = 4
+exclude = ["dev/x"]
+
+[tool.ruff.lint]
+ignore = ["C901", "E501", "E741", "W605", "C408", "E402"]
+select = ["C", "E", "F", "I", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401", "F403", "F811"]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["nanochat", "rustbpe"]
+known-third-party = ["torch", "numpy", "wandb", "transformers", "tqdm"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
