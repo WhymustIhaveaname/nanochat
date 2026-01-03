@@ -13,7 +13,7 @@ dependencies = [
     "setuptools>=80.9.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
-    "torch>=2.8.0,<2.9.0",  # 2.9.0+cu128 需要 NVSHMEM
+    "torch>=2.9.0",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
 ]
@@ -62,10 +62,10 @@ explicit = true
 
 [project.optional-dependencies]
 cpu = [
-    "torch>=2.8.0,<2.9.0",  # 2.9.0+cu128 需要 NVSHMEM
+    "torch>=2.9.0",
 ]
 gpu = [
-    "torch>=2.8.0,<2.9.0",  # 2.9.0+cu128 需要 NVSHMEM
+    "torch>=2.9.0",
 ]
 dev = [
     "matplotlib>=3.8.0",
