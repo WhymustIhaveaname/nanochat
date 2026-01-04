@@ -36,6 +36,7 @@ from nanochat.engine import Engine
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.tokenizer import get_token_bytes, get_tokenizer
+from nanochat.training_logger import TrainingLogger
 from scripts.base_eval import evaluate_model
 
 
@@ -97,6 +98,13 @@ get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else l
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
+
+# CSV training logger for scaling law analysis (only on master process)
+training_logger = TrainingLogger(
+    log_dir=os.path.join(get_base_dir(), "training_logs"),
+    run_name=f"d{depth}_{run}",
+    enabled=master_process,
+)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
 tokenizer = get_tokenizer()
@@ -407,6 +415,18 @@ while True:
     print0(
         f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time / 60:.2f}m"
     )
+    # Log to CSV for scaling law analysis
+    training_logger.log(
+        {
+            "step": step,
+            "train_loss": debiased_smooth_loss,
+            "tokens_consumed": (step + 1) * total_batch_size,
+            "lrm": lrm,
+            "grad_norm": grad_norm if grad_clip_enabled else 0.0,  # 0.0 if clipping disabled (grad_norm undefined)
+            "dt": dt,
+            "mfu": mfu,
+        }
+    )
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -462,5 +482,6 @@ get_report().log(
 )
 
 # cleanup
+training_logger.close()  # close CSV log file
 wandb_run.finish()  # wandb run finish
 compute_cleanup()

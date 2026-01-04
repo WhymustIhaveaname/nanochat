@@ -14,7 +14,7 @@
 
 # Default intermediate artifacts directory
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="/mnt/data/youran/repos/nanochat/base" # "$(pwd)/base"
+export NANOCHAT_BASE_DIR="/mnt/data/youran/repos/nanochat/workspace" # "$(pwd)/workspace"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------

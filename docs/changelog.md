@@ -38,3 +38,27 @@ Number of parameters: 28,901,376
 Number of parameters: 28,901,376 (non-embedding: 18,234,880)
 Tokens : Params (non-embedding) ratio: 20.00
 ```
+
+---
+
+### Training Logger (CSV 日志)
+
+新增 `nanochat/training_logger.py` 模块，用于保存训练日志以便 scaling law 分析。
+
+**设计**：
+- 接口参考 wandb，传入 dict 即可记录
+- 自动管理 `_timestamp` 和 `_walltime` 字段
+- 日志保存到 `$NANOCHAT_BASE_DIR/training_logs/` 目录
+- 文件名格式：`{run_name}_{timestamp}.csv`
+
+**使用**：
+```python
+from nanochat.training_logger import TrainingLogger
+
+logger = TrainingLogger(log_dir="path/to/logs", run_name="d20_exp1")
+logger.log({"step": 100, "train_loss": 2.345, "mfu": 45.2})
+logger.close()
+```
+
+**修改文件**：`scripts/base_train.py`
+- 添加 logger 初始化和 `log()` 调用
