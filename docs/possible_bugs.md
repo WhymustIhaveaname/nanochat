@@ -147,79 +147,6 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 ---
 
-## 4. ~~Generate 函数采样逻辑问题~~ (已澄清：非 Bug)
-
-> ⚠️ **澄清**: 经过仔细分析，这不是原版代码的 bug，而是 ning 版本在重构时引入的一个**降级**。原版代码是正确的。
-
-### ning 版本的问题
-
-ning 在重构 `engine.py` 的 `generate()` 函数时，将 forward 调用从循环末尾移到了循环开头，但第一次迭代没有正确处理，导致：
-
-**所有行的第一个生成 token 被强制设为相同值（broadcast）**，降低了多样本生成的多样性。
-
-### 原版代码 (正确 ✅)
-
-```python
-# 原版: Prefill 后扩展 logits 到 batch size
-logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
-
-# While 循环中每行独立采样
-while True:
-    next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
-    sampled_tokens = next_ids[:, 0].tolist()  # 每行可以得到不同的 token!
-    # ...处理...
-    logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]
-```
-
-**效果**: 即使第一个 token，每行也可以独立采样得到不同结果。
-
-### ning 版本代码 (降级 ❌)
-
-```python
-# ning 版: Prefill 时就采样（batch=1）
-logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-logits = logits[:, -1, :]  # (1, vocab) - 没有扩展!
-next_ids = sample_next_token(logits, rng, temperature, top_k)
-sampled_tokens = next_ids[:, 0].tolist()  # [单个 token]
-
-# While 循环中第一次迭代强制 broadcast
-first_iteration = True
-while True:
-    if first_iteration:
-        sampled_tokens = [sampled_tokens[0]] * num_samples  # 所有行强制相同!
-        # TODO: we should sample a token for each row instead of broadcasting
-        first_iteration = False
-    else:
-        logits = self.model.forward(ids, kv_cache=kv_cache_decode)
-        # ...正常采样...
-```
-
-**效果**: 第一个生成的 token 所有行都相同，只有后续 token 才能分叉。
-
-### 对比示例
-
-假设 `num_samples=3`, `temperature=1.0`:
-
-| 版本 | Row 0 | Row 1 | Row 2 |
-|------|-------|-------|-------|
-| **原版** | "The answer is **42**" | "The answer is **seven**" | "The answer is **unknown**" |
-| **ning 版** | "The answer is **42**" | "The answer is **42**, but..." | "The answer is **42** or..." |
-
-ning 版的第一个生成 token 全部被强制为 "42"。
-
-### 影响范围
-
-- **pass@k 评估**: 多样性降低会影响 pass@k 指标
-- **RL 训练**: `chat_rl.py` 中需要多样本采样，多样性降低可能影响训练效果
-- **ning 自己意识到了问题**: 留下了 TODO 注释
-
-### 结论
-
-**不建议采用 ning 版本的这个改动**。原版代码是正确的。
-
----
-
 ## 总结
 
 | Bug | 严重程度 | 触发条件 | 修复难度 |
@@ -227,7 +154,6 @@ ning 版的第一个生成 token 全部被强制为 "42"。
 | CORE Metric 内存泄漏 | 🔴 高 | 长时间训练 + 大模型 | 低 |
 | Rotary Embedding dtype | 🟡 中 | 混合精度训练 | 低 |
 | 环境变量名称错误 | 🟡 中 | 所有训练 | 低 |
-| Generate 采样逻辑 | 🟢 低 | 多样本生成 | 中 |
 
 ---
 
