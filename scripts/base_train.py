@@ -64,11 +64,13 @@ total_batch_size = 524288  # total desired batch size, in #tokens
 embedding_lr = 0.2  # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004  # learning rate for the unembedding parameters (Adam)
 weight_decay = 0.0  # weight decay for the embedding/unembedding parameters (Adam)
-matrix_lr = 0.02  # learning rate for the matrix parameters (Muon)
+matrix_lr = 0.02  # learning rate for the matrix parameters (Muon or AdamW)
+use_muon = True  # use Muon optimizer for transformer blocks (False = use AdamW for all)
 grad_clip = 1.0  # gradient clipping value (0.0 = disabled)
 warmup_ratio = 0.0  # ratio of iterations for LR warmup
 warmdown_ratio = 0.2  # ratio of iterations for LR warmdown
 final_lr_frac = 0.0  # final LR is this fraction of the initial LR
+lr_schedule = "linear"  # LR decay schedule: "linear" or "cosine"
 resume_from_step = -1  # resume training from this step of the optimization (-1 = disable)
 # Evaluation
 eval_every = 250  # every how many steps to evaluate the model for val bpb
@@ -77,6 +79,7 @@ core_metric_every = 2000  # every how many steps to evaluate the core metric (-1
 core_metric_max_per_task = 500  # examples per task in estimating the core metric
 sample_every = 2000  # every how many steps to sample from the model
 save_every = -1  # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
+print_every = 10  # every how many steps to print training progress
 # Output
 model_tag = ""  # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
@@ -95,16 +98,13 @@ autocast_ctx = (
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
+# Run name for logging (used by wandb and training logger)
+run_name = f"{run}_d{depth}"
+
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=run_name, config=user_config)
 
-# CSV training logger for scaling law analysis (only on master process)
-training_logger = TrainingLogger(
-    log_dir=os.path.join(get_base_dir(), "training_logs"),
-    run_name=f"d{depth}_{run}",
-    enabled=master_process,
-)
 
 # Tokenizer will be useful for evaluation, also we need the vocab size
 tokenizer = get_tokenizer()
@@ -205,12 +205,40 @@ total_flops = num_flops_per_token * total_tokens
 pfdays = total_flops / (1e15 * 86400)  # 1 PFday = 1e15 FLOPs × 86400 seconds
 print0(f"Total training FLOPs estimate: {total_flops:.3e} = {pfdays:.4g} PFdays")
 
-# -----------------------------------------------------------------------------
-# Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(
-    unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay
+# Initialize CSV training logger with metadata (only on master process)
+training_logger = TrainingLogger(
+    log_dir=os.path.join(get_base_dir(), "training_logs"),
+    subdir=run,
+    run_name=run_name,
+    metadata={
+        "params": num_params,
+        "params_noembd": num_params_non_embedding,
+        "total_tokens": total_tokens,
+        "embedding_lr": embedding_lr,
+        "unembedding_lr": unembedding_lr,
+        "matrix_lr": matrix_lr,
+        "optimizer": "Muon+AdamW" if use_muon else "AdamW",
+        "lr_schedule": lr_schedule,
+        "eff_batchsize": total_batch_size,
+        "iter": num_iterations,
+        "depth": depth,
+        "run": run,
+    },
+    enabled=master_process,
 )
-adamw_optimizer, muon_optimizer = optimizers
+
+# -----------------------------------------------------------------------------
+# Initialize the Optimizer
+optimizers = model.setup_optimizers(
+    unembedding_lr=unembedding_lr,
+    embedding_lr=embedding_lr,
+    matrix_lr=matrix_lr,
+    weight_decay=weight_decay,
+    use_muon=use_muon,
+)
+# optimizers is [adamw] if use_muon=False, or [adamw, muon] if use_muon=True
+adamw_optimizer = optimizers[0]
+muon_optimizer = optimizers[1] if use_muon else None
 
 if resuming:
     for opt, dat in zip(optimizers, optimizer_data):
@@ -237,16 +265,27 @@ x, y, dataloader_state_dict = next(train_loader)  # kick off load of the very fi
 
 
 # Learning rate scheduler
+import math
+
+
 def get_lr_multiplier(it):
     warmup_iters = round(warmup_ratio * num_iterations)
     warmdown_iters = round(warmdown_ratio * num_iterations)
     if it < warmup_iters:
+        # Linear warmup
         return (it + 1) / warmup_iters
     elif it <= num_iterations - warmdown_iters:
+        # Constant LR
         return 1.0
     else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * final_lr_frac
+        # Decay phase: linear or cosine
+        progress = (num_iterations - it) / warmdown_iters  # 1.0 -> 0.0
+        if lr_schedule == "cosine":
+            # Cosine decay: smooth transition from 1.0 to final_lr_frac
+            return final_lr_frac + 0.5 * (1.0 - final_lr_frac) * (1.0 + math.cos(math.pi * (1.0 - progress)))
+        else:
+            # Linear decay (default)
+            return progress * 1.0 + (1 - progress) * final_lr_frac
 
 
 # Momentum scheduler for Muon optimizer
@@ -290,11 +329,12 @@ while True:
             min_val_bpb = val_bpb
         wandb_run.log(
             {
-                "step": step,
+                "global_step": step,
                 "total_training_flops": flops_so_far,
                 "total_training_time": total_training_time,
                 "val/bpb": val_bpb,
-            }
+            },
+            step=step,
         )
         model.train()
 
@@ -308,11 +348,12 @@ while True:
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log(
             {
-                "step": step,
+                "global_step": step,
                 "total_training_flops": flops_so_far,
                 "core_metric": results["core_metric"],
                 "centered_results": results["centered_results"],
-            }
+            },
+            step=step,
         )
         model.train()
 
@@ -389,9 +430,10 @@ while True:
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * lrm
-    muon_momentum = get_muon_momentum(step)
-    for group in muon_optimizer.param_groups:
-        group["momentum"] = muon_momentum
+    if muon_optimizer is not None:
+        muon_momentum = get_muon_momentum(step)
+        for group in muon_optimizer.param_groups:
+            group["momentum"] = muon_momentum
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
@@ -412,10 +454,11 @@ while True:
     if step > 10:
         total_training_time += dt  # only count the time after the first 10 steps
     print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print0(
-        f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time / 60:.2f}m"
-    )
-    # Log to CSV for scaling law analysis
+    if step % print_every == 0:
+        print0(
+            f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time / 60:.2f}m"
+        )
+    # Log training metrics (CSV logger and wandb, same frequency)
     training_logger.log(
         {
             "step": step,
@@ -427,20 +470,19 @@ while True:
             "mfu": mfu,
         }
     )
-    if step % 100 == 0:
-        log_data = {
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-        }
-        if grad_clip_enabled:
-            log_data["train/grad_norm"] = grad_norm
-        wandb_run.log(log_data)
+    wandb_log_data = {
+        "global_step": step,
+        "total_training_flops": flops_so_far,
+        "total_training_time": total_training_time,
+        "train/loss": debiased_smooth_loss,
+        "train/lrm": lrm,
+        "train/dt": dt,
+        "train/tok_per_sec": tok_per_sec,
+        "train/mfu": mfu,
+    }
+    if grad_clip_enabled:
+        wandb_log_data["train/grad_norm"] = grad_norm
+    wandb_run.log(wandb_log_data, step=step)
 
     # state update
     step += 1

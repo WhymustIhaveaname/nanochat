@@ -62,3 +62,52 @@ logger.close()
 
 **修改文件**：`scripts/base_train.py`
 - 添加 logger 初始化和 `log()` 调用
+
+---
+
+## 2025-01-05
+
+### 优化器和学习率调度支持
+
+新增可配置参数，支持纯 AdamW 优化器和 cosine decay 学习率调度。
+
+**新增配置项**（`scripts/base_train.py`）：
+```python
+use_muon = True      # 使用 Muon 优化器 (False = 全部用 AdamW)
+lr_schedule = "linear"  # 学习率衰减: "linear" 或 "cosine"
+```
+
+**使用示例**：
+```bash
+# 纯 AdamW + cosine decay + warmup 到 10%
+python -m scripts.base_train --use_muon=False --lr_schedule=cosine --warmup_ratio=0.1 --warmdown_ratio=0.9 --final_lr_frac=0.1
+```
+
+**修改文件**：
+- `nanochat/gpt.py`：`setup_optimizers()` 新增 `use_muon` 参数
+  - `use_muon=False` 时，dim < 2 的参数不应用 weight_decay
+  - 打印各参数组的 lr 和 weight_decay 便于验证
+- `scripts/base_train.py`：新增 `use_muon` 和 `lr_schedule` 配置项
+
+---
+
+### Training Logger 增强
+
+- 支持 `subdir` 参数，日志保存到 `training_logs/{run}/{run_name}_{mmdd}.csv`
+- 支持 `metadata` 参数，在 CSV 开头写入 `# key=value` 格式的注释
+- 新增 `print_every` 参数控制打印频率（默认每 10 步）
+- 文件名 timestamp 格式简化为 `mmdd`
+
+---
+
+### wandb 日志改进
+
+- `run_name` 统一为 `f"d{depth}_{run}"`，与 CSV logger 一致
+- wandb 训练日志频率改为每步记录，与 CSV logger 同步
+- 所有 `wandb_run.log()` 添加 `step=step` 参数和 `global_step` 字段
+
+---
+
+## TODO
+
+- [ ] MFU 计算硬编码了 H100 的理论峰值 (989 TFLOPs/s)，应该根据 GPU 型号自动查询对应的 FLOPs

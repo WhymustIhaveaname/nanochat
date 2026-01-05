@@ -7,7 +7,12 @@ Usage:
     from nanochat.training_logger import TrainingLogger
 
     # Initialize (only on master process)
-    logger = TrainingLogger("path/to/logs", run_name="d20_exp1")
+    logger = TrainingLogger(
+        "path/to/logs",
+        subdir="muon_exp",
+        run_name="d20_muon_exp",
+        metadata={"params": 28901376, "total_tokens": 1000000},
+    )
 
     # Log each step - pass any dict, keys become columns
     logger.log({"step": 100, "train_loss": 2.345, "mfu": 45.2})
@@ -29,20 +34,25 @@ class TrainingLogger:
     - Accepts any dict, keys become CSV columns (sorted alphabetically)
     - Automatically adds timestamp and walltime columns
     - First log() call determines the columns (subsequent calls must match)
+    - Supports metadata comments at the top of the CSV file (lines starting with #)
     """
 
     def __init__(
         self,
         log_dir: str,
         run_name: str = "default",
+        subdir: str | None = None,
+        metadata: dict | None = None,
         enabled: bool = True,
     ):
         """
         Initialize the training logger.
 
         Args:
-            log_dir: Directory to save log files
+            log_dir: Base directory to save log files
             run_name: Run name for the filename
+            subdir: Optional subdirectory under log_dir (e.g., run name for grouping)
+            metadata: Optional dict of metadata to write as comments at the top of the CSV
             enabled: If False, all operations are no-ops (useful for non-master processes)
         """
         self.enabled = enabled
@@ -51,16 +61,19 @@ class TrainingLogger:
         self._writer = None
         self._columns = None
         self._closed = False
+        self._metadata = metadata
 
         if not enabled:
             self.log_path = None
             return
 
-        # Create log directory
+        # Create log directory (with optional subdirectory)
+        if subdir:
+            log_dir = os.path.join(log_dir, subdir)
         os.makedirs(log_dir, exist_ok=True)
 
         # Create unique filename with timestamp
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp_str = datetime.now().strftime("%m%d")
         filename = f"{run_name}_{timestamp_str}.csv"
         self.log_path = os.path.join(log_dir, filename)
 
@@ -89,6 +102,12 @@ class TrainingLogger:
         if self._file is None:
             self._columns = sorted(row.keys())
             self._file = open(self.log_path, "w", newline="")
+
+            # Write metadata comments at the top of the file
+            if self._metadata:
+                for key, value in self._metadata.items():
+                    self._file.write(f"# {key}={value}\n")
+
             self._writer = csv.DictWriter(self._file, fieldnames=self._columns)
             self._writer.writeheader()
 
