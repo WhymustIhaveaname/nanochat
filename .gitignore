@@ -12,3 +12,6 @@ eval_bundle/
 CLAUDE.md
 wandb/
 workspace/
+**/outputs/
+*.png
+*.csv

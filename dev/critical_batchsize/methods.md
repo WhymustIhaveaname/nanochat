@@ -188,24 +188,82 @@ $$\mathcal{B}_{\text{crit}} = \frac{E_{\min}}{S_{\min}}$$
 
 ---
 
-## 文件结构
+## 估算实验范围
 
+Kaplan scaling law 给出 $\mathcal{B}_{\text{crit}}$ 与 loss 的关系：
+
+$$\mathcal{B}_{\text{crit}} = \frac{B^*}{L^{1/\alpha_B}}$$
+
+其中 $B^* \approx 2 \times 10^8$ tokens，$\alpha_B \approx 0.21$。
+
+| Loss | $\mathcal{B}_{\text{crit}}$ |
+|------|----------------------------|
+| 6 | ~40K |
+| 5 | ~94K |
+| 4 | ~267K |
+| 3 | ~1M |
+
+---
+
+## nanochat 参考配置
+
+| 参数 | 值 |
+|------|-----|
+| depth | 20 |
+| model_dim | 1280 |
+| batch_size | 524K (2^19) |
+
+LR（针对上述配置调优）：
+
+| 参数组 | LR | 优化器 | 备注 |
+|--------|-----|--------|------|
+| embedding | 0.3 | Adam | input muP |
+| unembedding | 0.004 | Adam | output muP |
+| matrix | 0.02 | Muon | |
+| scalar | 0.5 | Adam | 我们不训这个 |
+
+muP 表格：
+
+| | Input weights & all biases | Hidden weights | Output weights |
+|---|---|---|---|
+| Init. Var. | 1/fan_in | 1/fan_in | 1/fan_in² |
+| SGD LR | fan_out | 1 | 1/fan_in |
+| Adam LR | 1 | 1/fan_in | 1/fan_in |
+
+**depth=4 时的 LR（按 muP 缩放，基于 batch_size=524K）**：
+
+| 参数组 | SGD | Adam |
+|--------|-----|------|
+| embd | 0.06 | 0.3 |
+| matrix | 0.02 | 0.1 |
+| lm_head | 0.02 | 0.02 |
+
+> 备注：对于 AdamW，$\text{lr} \propto \sqrt{\text{batch\_size}}$，上表基于 batch_size=524K
+
+---
+
+## 训练命令
+
+### depth=4 (Adam LR 基准: embd=0.3, matrix=0.1, lm_head=0.02)
+
+```bash
+# bs=16384, scale=0.177
+torchrun --standalone --nproc_per_node=2 -m dev.critical_batchsize.transformer.train \
+  depth=4 batch_size=16384 lr_embd=0.053 lr_matrix=0.018 lr_lm_head=0.0035
+
+# bs=32768, scale=0.25
+torchrun --standalone --nproc_per_node=2 -m dev.critical_batchsize.transformer.train \
+  depth=4 batch_size=32768 lr_embd=0.075 lr_matrix=0.025 lr_lm_head=0.005
 ```
-dev/critical_batchsize/
-├── methods.md                 # 本文档
-│
-├── transformer/               # Transformer 语言模型实验
-│   ├── train.py               # Phase 1: 训练 + 记录 loss + 保存 checkpoint
-│   ├── measure.py             # Phase 2: 测 B_noise + B_simple
-│   ├── outputs_sgd/
-│   ├── outputs_adamw/
-│   └── outputs_muon/
-│
-├── cnn/                       # CNN 图片分类实验（结构同 transformer/）
-│
-└── analysis/                  # 公共数据分析
-    ├── fit_bcrit.py
-    ├── fit_bnoise.py
-    ├── fit_bsimple.py
-    └── *.png / *.csv          # 分析结果直接堆这里
+
+### depth=8 (Adam LR 基准: embd=0.3, matrix=0.05, lm_head=0.01)
+
+```bash
+# bs=16384, scale=0.177
+torchrun --standalone --nproc_per_node=2 -m dev.critical_batchsize.transformer.train \
+  depth=8 batch_size=16384 lr_embd=0.053 lr_matrix=0.0088 lr_lm_head=0.0018
+
+# bs=32768, scale=0.25
+torchrun --standalone --nproc_per_node=2 -m dev.critical_batchsize.transformer.train \
+  depth=8 batch_size=32768 lr_embd=0.075 lr_matrix=0.013 lr_lm_head=0.0025
 ```

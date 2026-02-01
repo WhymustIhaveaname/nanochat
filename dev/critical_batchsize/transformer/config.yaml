@@ -1,0 +1,27 @@
+# 模型
+depth: 4
+
+# 优化
+optimizer: adamw  # sgd / adamw / muon
+lr_embd: 0.3
+lr_matrix: 0.1
+lr_lm_head: 0.02
+
+# 硬件相关
+seq_len: 8192
+
+# B_crit 实验变量（tokens），必须是 seq_len 的整数倍
+batch_size: 32768
+
+# 训练量
+train_ratio: 80  # 训练 token 数 = train_ratio × 参数量（不含 embedding）
+
+# 评估
+eval_times: 80  # 整个训练过程 eval 多少次（最后一步必 eval）
+eval_seq_len: 65536
+max_eval_tokens: 16777216
+
+# Hydra 输出目录
+hydra:
+  run:
+    dir: dev/critical_batchsize/transformer/outputs/${now:%m-%d}_d${depth}_${optimizer}_${batch_size}
