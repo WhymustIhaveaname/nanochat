@@ -135,6 +135,27 @@ $$\mathcal{B}_{\text{crit}} = \frac{E_{\min}}{S_{\min}}$$
 3. 拟合公式 2.11 得到 $S_{\min}$、$E_{\min}$
 4. 计算 $\mathcal{B}_{\text{crit}} = E_{\min} / S_{\min}$
 
+### 线性拟合推导
+
+公式 2.11 可以变形为线性形式，便于使用线性最小二乘拟合：
+
+$$\left(\frac{S}{S_{\min}} - 1\right)\left(\frac{E}{E_{\min}} - 1\right) = 1$$
+
+$$\frac{SE}{S_{\min}E_{\min}} = \frac{S}{S_{\min}} + \frac{E}{E_{\min}}$$
+
+$$SE = S \cdot E_{\min} + E \cdot S_{\min}$$
+
+$$1 = \frac{E_{\min}}{E} + \frac{S_{\min}}{S}$$
+
+即 $1/S$ 与 $1/E$ 呈线性关系：
+
+$$\frac{1}{S} = \frac{1}{S_{\min}} - \frac{E_{\min}}{S_{\min}} \cdot \frac{1}{E}$$
+
+拟合 $1/S = a + b \cdot (1/E)$，则：
+- $S_{\min} = 1/a$
+- $E_{\min} = -b/a$
+- $\mathcal{B}_{\text{crit}} = E_{\min}/S_{\min} = -b$
+
 ### 计算复杂度
 
 需要完整训练多个模型，**远大于微分法**。

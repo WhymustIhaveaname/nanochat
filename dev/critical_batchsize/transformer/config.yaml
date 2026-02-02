@@ -14,10 +14,10 @@ seq_len: 8192
 batch_size: 32768
 
 # 训练量
-train_ratio: 80  # 训练 token 数 = train_ratio × 参数量（不含 embedding）
+train_ratio: 40  # 训练 token 数 = train_ratio × 参数量（不含 embedding）
 
 # 评估
-eval_times: 80  # 整个训练过程 eval 多少次（最后一步必 eval）
+eval_times: 40  # 整个训练过程 eval 多少次（最后一步必 eval）
 eval_seq_len: 65536
 max_eval_tokens: 16777216
 
@@ -25,3 +25,6 @@ max_eval_tokens: 16777216
 hydra:
   run:
     dir: dev/critical_batchsize/transformer/outputs/${now:%m-%d}_d${depth}_${optimizer}_${batch_size}
+
+# wandb
+wandb_project: muon  # 设为 null 禁用

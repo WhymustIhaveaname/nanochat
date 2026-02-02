@@ -12,12 +12,13 @@ from contextlib import nullcontext
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+import wandb
 import torch
 import torch.nn as nn
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type, get_peak_flops, DummyWandb
 from nanochat.tokenizer import get_tokenizer
 
 
@@ -27,11 +28,15 @@ def main(cfg: DictConfig):
 
 
 def train(cfg: DictConfig):
+    training_start_time = time.time()
+
     # Setup
     device_type = autodetect_device_type()
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     master_process = ddp_rank == 0
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+
+    gpu_peak_flops = get_peak_flops(torch.cuda.get_device_name())
 
     tokenizer = get_tokenizer()
 
@@ -58,7 +63,9 @@ def train(cfg: DictConfig):
     raw_model = model.module if ddp else model
 
     param_counts = raw_model.num_scaling_params()
+    num_flops_per_token = raw_model.estimate_flops()
     print0(f"Param counts: {param_counts}")
+    print0(f"FLOPs per token: {num_flops_per_token:e}")
     total_tokens = int(cfg.train_ratio * param_counts["transformer_matrices"])
     num_iterations = total_tokens // cfg.batch_size
     eval_every = max(1, num_iterations // cfg.eval_times)
@@ -114,8 +121,17 @@ def train(cfg: DictConfig):
 
     # Output setup
     output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
+    run_name = os.path.basename(output_dir)
     ckpt_dir = os.path.join(output_dir, "checkpoints")
     print0(f"Output dir: {output_dir}")
+
+    # Wandb init
+    use_wandb = cfg.wandb_project is not None and master_process
+    if use_wandb:
+        wandb_run = wandb.init(project=cfg.wandb_project, name=run_name, config=OmegaConf.to_container(cfg))
+    else:
+        wandb_run = DummyWandb()
+
     if master_process:
         os.makedirs(ckpt_dir, exist_ok=True)
         OmegaConf.save(cfg, os.path.join(output_dir, "config.yaml"))
@@ -145,6 +161,7 @@ def train(cfg: DictConfig):
         if master_process:
             eval_writer.writerow([step, val_loss])
             eval_csv.flush()
+            wandb_run.log({"val/loss": val_loss}, step=step)
             ckpt_path = os.path.join(ckpt_dir, f"step_{step:05d}.pt")
             torch.save(raw_model.state_dict(), ckpt_path)
             print0(f"Saved: {ckpt_path}")
@@ -161,6 +178,7 @@ def train(cfg: DictConfig):
             break
 
         # Training step
+        t0 = time.time()
         optimizer.zero_grad()
         total_loss = 0.0
         for _ in range(grad_accum_steps):
@@ -169,19 +187,45 @@ def train(cfg: DictConfig):
                 loss = model(x, y)
             (loss / grad_accum_steps).backward()
             total_loss += loss.item()
+
+        # Grad norm per group (before optimizer.step) - RMS of gradients
+        grad_norms = {}
+        for group in param_groups:
+            sq_sum = sum((p.grad ** 2).sum().item() for p in group["params"] if p.grad is not None)
+            num_params = sum(p.numel() for p in group["params"] if p.grad is not None)
+            grad_norms[group["name"]] = (sq_sum / num_params) ** 0.5 if num_params > 0 else 0.0
+
         optimizer.step()
+        dt = time.time() - t0
         avg_loss = total_loss / grad_accum_steps
+
+        # MFU: tokens/sec * flops_per_token / (peak_flops * num_gpus)
+        tok_per_sec = cfg.batch_size / dt
+        flops_per_sec = num_flops_per_token * cfg.batch_size / dt
+        mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
 
         if master_process:
             train_writer.writerow([step, avg_loss])
+            wall_time_h = (time.time() - training_start_time) / 3600
+            wandb_run.log({
+                "training/loss": avg_loss,
+                "training/lr": cfg.lr_matrix,
+                "training/mfu": mfu,
+                "training/tok_per_sec": tok_per_sec,
+                "training/wall_time(h)": wall_time_h,
+                "mup/gradnorm_embd": grad_norms["embd"],
+                "mup/gradnorm_lm_head": grad_norms["lm_head"],
+                "mup/gradnorm_matrix": grad_norms["matrix"],
+            }, step=step)
             if step % 10 == 0 or step < 10 or step == num_iterations:
                 train_csv.flush()
-                print0(f"Step {step:05d} | train loss: {avg_loss:.4f}")
+                print0(f"Step {step:05d} | train loss: {avg_loss:.4f} | mfu: {mfu:.1f}%")
 
     # Cleanup
     if master_process:
         train_csv.close()
         eval_csv.close()
+    wandb_run.finish()
     compute_cleanup()
     print0("Done.")
 
