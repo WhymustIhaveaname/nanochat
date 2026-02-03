@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
 from scipy.ndimage import gaussian_filter1d
-from scipy.optimize import curve_fit
 
 
 def smooth_loss(loss: np.ndarray, sigma_frac: float = 0.01) -> np.ndarray:
@@ -52,10 +51,10 @@ def interpolate_step_for_loss(step: np.ndarray, loss: np.ndarray, target: float)
 
 def fit_smin_emin(E: np.ndarray, S: np.ndarray) -> tuple[float, float, float]:
     """Linear regression on 1/S vs 1/E.
-    
+
     From: 1 = Emin/E + Smin/S
     We get: 1/S = 1/Smin - (Emin/Smin) * (1/E)
-    
+
     So fitting 1/S = a + b * (1/E):
       - a = 1/Smin -> Smin = 1/a
       - b = -Emin/Smin -> Emin = -b * Smin = -b/a
@@ -159,9 +158,9 @@ def run(cfg: DictConfig) -> None:
         n = len(result_rows)
         indices = [0, n // 2, n - 1]  # low, mid, high
         colors = ["tab:blue", "tab:orange", "tab:green"]
-        
+
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-        
+
         # Collect all inv_E for axis range
         all_inv_E = []
         for idx, color in zip(indices, colors):
@@ -169,20 +168,19 @@ def run(cfg: DictConfig) -> None:
             E_arr = np.asarray([row["E"] for row in points_rows if row["loss_target"] == target], dtype=float)
             S_arr = np.asarray([row["step"] for row in points_rows if row["loss_target"] == target], dtype=float)
             smin, emin, r2 = fit_smin_emin(E_arr, S_arr)
-            
+
             inv_E = 1.0 / E_arr
             inv_S = 1.0 / S_arr
             all_inv_E.extend(inv_E)
-            
+
             # Scatter points
             axes[0].scatter(inv_E, inv_S, color=color, alpha=0.8, marker="o")
-            
+
             # Fit line
             inv_E_line = np.linspace(inv_E.min() * 0.8, inv_E.max() * 1.2, 100)
             inv_S_line = 1.0 / smin - (emin / smin) * inv_E_line
-            axes[0].plot(inv_E_line, inv_S_line, color=color, 
-                        label=f"L={target:.2f} ($R^2$={r2:.4f})")
-        
+            axes[0].plot(inv_E_line, inv_S_line, color=color, label=f"L={target:.2f} ($R^2$={r2:.4f})")
+
         axes[0].set_title("1/S vs 1/E @ different loss levels")
         axes[0].set_xlabel("1/E")
         axes[0].set_ylabel("1/S")

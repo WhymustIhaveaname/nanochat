@@ -5,20 +5,20 @@ Usage:
     python -m dev.critical_batchsize.transformer.train batch_size=1000000
 """
 
-import os
 import csv
+import os
 import time
 from contextlib import nullcontext
 
 import hydra
-from omegaconf import DictConfig, OmegaConf
-import wandb
 import torch
 import torch.nn as nn
+import wandb
+from omegaconf import DictConfig, OmegaConf
 
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.common import DummyWandb, autodetect_device_type, compute_cleanup, compute_init, get_peak_flops, print0
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type, get_peak_flops, DummyWandb
+from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 
 
@@ -34,7 +34,9 @@ def train(cfg: DictConfig):
     device_type = autodetect_device_type()
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
     master_process = ddp_rank == 0
-    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+    autocast_ctx = (
+        torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+    )
 
     gpu_peak_flops = get_peak_flops(torch.cuda.get_device_name())
 
@@ -57,7 +59,7 @@ def train(cfg: DictConfig):
     model.resid_lambdas.requires_grad_(False)  # 禁用 scalar 学习
     model.x0_lambdas.requires_grad_(False)
     model.resid_lambdas.fill_(1.0)  # 固定为 1（恒等残差）
-    model.x0_lambdas.fill_(0.0)     # 固定为 0（无 x0 混合）
+    model.x0_lambdas.fill_(0.0)  # 固定为 0（无 x0 混合）
     if ddp:
         model = nn.parallel.DistributedDataParallel(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
     raw_model = model.module if ddp else model
@@ -73,7 +75,9 @@ def train(cfg: DictConfig):
 
     # Gradient accumulation (micro batch = 1 sample with seqpack)
     tokens_per_micro = cfg.seq_len * ddp_world_size
-    assert cfg.batch_size % tokens_per_micro == 0, f"batch_size {cfg.batch_size} must be divisible by {tokens_per_micro}"
+    assert cfg.batch_size % tokens_per_micro == 0, (
+        f"batch_size {cfg.batch_size} must be divisible by {tokens_per_micro}"
+    )
     grad_accum_steps = cfg.batch_size // tokens_per_micro
     print0(f"Batch size {cfg.batch_size} => grad_accum: {grad_accum_steps}")
 
@@ -191,7 +195,7 @@ def train(cfg: DictConfig):
         # Grad norm per group (before optimizer.step) - RMS of gradients
         grad_norms = {}
         for group in param_groups:
-            sq_sum = sum((p.grad ** 2).sum().item() for p in group["params"] if p.grad is not None)
+            sq_sum = sum((p.grad**2).sum().item() for p in group["params"] if p.grad is not None)
             num_params = sum(p.numel() for p in group["params"] if p.grad is not None)
             grad_norms[group["name"]] = (sq_sum / num_params) ** 0.5 if num_params > 0 else 0.0
 
@@ -207,16 +211,19 @@ def train(cfg: DictConfig):
         if master_process:
             train_writer.writerow([step, avg_loss])
             wall_time_h = (time.time() - training_start_time) / 3600
-            wandb_run.log({
-                "training/loss": avg_loss,
-                "training/lr": cfg.lr_matrix,
-                "training/mfu": mfu,
-                "training/tok_per_sec": tok_per_sec,
-                "training/wall_time(h)": wall_time_h,
-                "mup/gradnorm_embd": grad_norms["embd"],
-                "mup/gradnorm_lm_head": grad_norms["lm_head"],
-                "mup/gradnorm_matrix": grad_norms["matrix"],
-            }, step=step)
+            wandb_run.log(
+                {
+                    "training/loss": avg_loss,
+                    "training/lr": cfg.lr_matrix,
+                    "training/mfu": mfu,
+                    "training/tok_per_sec": tok_per_sec,
+                    "training/wall_time(h)": wall_time_h,
+                    "mup/gradnorm_embd": grad_norms["embd"],
+                    "mup/gradnorm_lm_head": grad_norms["lm_head"],
+                    "mup/gradnorm_matrix": grad_norms["matrix"],
+                },
+                step=step,
+            )
             if step % 10 == 0 or step < 10 or step == num_iterations:
                 train_csv.flush()
                 print0(f"Step {step:05d} | train loss: {avg_loss:.4f} | mfu: {mfu:.1f}%")
