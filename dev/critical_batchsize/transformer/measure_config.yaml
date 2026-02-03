@@ -1,0 +1,25 @@
+# run 目录（包含 config.yaml, loss_eval.csv, checkpoints/）
+run_dir: dev/critical_batchsize/transformer/outputs/02-02_d4_adamw_8192
+
+# Optimizer
+optimizer: adamw  # sgd / adamw
+
+# Learning rate 扫描范围（绝对值）
+lr_min: 0.0
+lr_max: 0.001
+lr_steps: 5
+
+# Batch sizes（tokens）
+batch_sizes: [32768, 65536, 131072]
+
+# 可选：只跑单个 step（用于快速测试）
+single_step: 3072
+
+# 可选：覆盖 eval tokens 数量（用于快速测试）
+max_eval_tokens: 4194304  # 4M tokens (default 16M / 4)
+
+# Hydra 输出目录（不需要，直接输出到 run_dir/measure/）
+hydra:
+  run:
+    dir: .
+  output_subdir: null
