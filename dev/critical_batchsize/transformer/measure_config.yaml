@@ -6,11 +6,11 @@ optimizer: sgd  # sgd / adamw
 
 # Learning rate 扫描范围（绝对值）
 lr_min: 0.0
-lr_max: 10.0
-lr_steps: 6
+lr_max: 5.0
+lr_steps: 11
 
 # Batch sizes（tokens）
-batch_sizes: [8192, 16384, 32768, 65536]
+batch_sizes: [4096, 8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536]
 
 # 要测量的 checkpoint step
 step: 3072

@@ -13,8 +13,8 @@ from contextlib import nullcontext
 import hydra
 import matplotlib.pyplot as plt
 import numpy as np
-import ray
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
@@ -104,40 +104,39 @@ def _check_optimizer_state(optimizer, optimizer_type, n=4):
         raise ValueError(f"Unsupported optimizer: {optimizer_type}")
 
 
-@ray.remote(num_gpus=1)
-class EvalWorker:
-    """Ray actor for parallel evaluation. Each worker holds a model copy on its GPU."""
+def _eval_worker_loop(gpu_id, run_cfg_dict, vocab_size, eval_batches_cpu, optimizer_type, task_queue, result_queue):
+    """Persistent worker: build model once on assigned GPU, process tasks from queue."""
+    device = torch.device(f"cuda:{gpu_id}")
+    model, trainable_params = build_model(run_cfg_dict, vocab_size, device)
+    eval_batches = [(x.to(device), y.to(device), n) for x, y, n in eval_batches_cpu]
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    def __init__(self, run_cfg_dict, vocab_size, eval_batches_cpu, optimizer_type):
-        self.device = torch.device("cuda")
-        self.model, self.trainable_params = build_model(run_cfg_dict, vocab_size, self.device)
-        self.optimizer_type = optimizer_type
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+        task_id, ckpt_state_cpu, grads_cpu, lr = task
 
-        # Move eval batches to GPU (eval_batches_cpu is already deserialized by Ray)
-        self.eval_batches = [(x.to(self.device), y.to(self.device), n) for x, y, n in eval_batches_cpu]
-        self.autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        ckpt_state = {k: v.to(device) for k, v in ckpt_state_cpu.items()}
+        model.load_state_dict(ckpt_state)
+        model.train()
 
-    def step_and_eval(self, ckpt_state_cpu, grads_cpu, lr):
-        ckpt_state = {k: v.to(self.device) for k, v in ckpt_state_cpu.items()}
-        self.model.load_state_dict(ckpt_state)
-        self.model.train()
-
-        for n, p in self.model.named_parameters():
+        for n, p in model.named_parameters():
             if n in grads_cpu:
-                p.grad = grads_cpu[n].to(device=self.device, dtype=p.dtype)
+                p.grad = grads_cpu[n].to(device=device, dtype=p.dtype)
 
-        optimizer = _build_optimizer(self.optimizer_type, self.trainable_params, lr)
-        _init_optimizer_state(optimizer, self.optimizer_type)
+        optimizer = _build_optimizer(optimizer_type, trainable_params, lr)
+        _init_optimizer_state(optimizer, optimizer_type)
         optimizer.step()
-        _check_optimizer_state(optimizer, self.optimizer_type)
+        _check_optimizer_state(optimizer, optimizer_type)
 
-        self.model.eval()
+        model.eval()
         total_loss, total_tokens = 0.0, 0
-        with torch.no_grad(), self.autocast_ctx:
-            for x, y, num_tokens in self.eval_batches:
-                total_loss += self.model(x, y).item() * num_tokens
+        with torch.no_grad(), autocast_ctx:
+            for x, y, num_tokens in eval_batches:
+                total_loss += model(x, y).item() * num_tokens
                 total_tokens += num_tokens
-        return total_loss / total_tokens
+        result_queue.put((task_id, total_loss / total_tokens))
 
 
 def build_data(tokenizer, run_cfg, device):
@@ -228,11 +227,20 @@ def main(cfg: DictConfig):
     eval_batches = cache_eval_batches(val_loader, max_eval_tokens)
     print0(f"Cached {len(eval_batches)} eval batches ({max_eval_tokens} tokens)")
 
-    ray.init(ignore_reinit_error=True)
+    ctx = mp.get_context("spawn")
+    task_queue = ctx.Queue()
+    result_queue = ctx.Queue()
     run_cfg_dict = OmegaConf.to_container(run_cfg)
     num_workers = torch.cuda.device_count()
-    workers = [EvalWorker.remote(run_cfg_dict, vocab_size, eval_batches, cfg.optimizer) for _ in range(num_workers)]
-    print0(f"Created {num_workers} Ray workers")
+    workers = []
+    for gpu_id in range(num_workers):
+        p = ctx.Process(
+            target=_eval_worker_loop,
+            args=(gpu_id, run_cfg_dict, vocab_size, eval_batches, cfg.optimizer, task_queue, result_queue),
+        )
+        p.start()
+        workers.append(p)
+    print0(f"Created {num_workers} eval workers")
 
     lrs = np.linspace(cfg.lr_min, cfg.lr_max, cfg.lr_steps)
     batch_sizes = list(cfg.batch_sizes)
@@ -240,7 +248,7 @@ def main(cfg: DictConfig):
     print0(f"LRs: [{', '.join(f'{lr:.4f}' for lr in lrs)}]")
 
     ckpt_state = torch.load(ckpt_path, map_location=device, weights_only=True)
-    ckpt_state_ref = ray.put({k: v.cpu() for k, v in ckpt_state.items()})
+    ckpt_state_cpu = {k: v.cpu() for k, v in ckpt_state.items()}
 
     eps_opts = []
     all_coeffs = []
@@ -256,12 +264,15 @@ def main(cfg: DictConfig):
         grad_norm_sqs.append(grad_norm_sq)
         print0(f"  [B={B}] |g|² = {grad_norm_sq:.6e}")
 
-        grads_ref = ray.put({k: v.cpu() for k, v in grads.items()})
-        tasks = []
+        grads_cpu = {k: v.cpu() for k, v in grads.items()}
         for lr_idx, lr in enumerate(lrs):
-            tasks.append(workers[lr_idx % len(workers)].step_and_eval.remote(ckpt_state_ref, grads_ref, float(lr)))
+            task_queue.put((lr_idx, ckpt_state_cpu, grads_cpu, float(lr)))
 
-        losses_for_B = ray.get(tasks)
+        results = {}
+        for _ in range(len(lrs)):
+            task_id, loss = result_queue.get()
+            results[task_id] = loss
+        losses_for_B = [results[i] for i in range(len(lrs))]
         all_losses[b_idx] = losses_for_B
 
         print0(f"    {'lr':>8}  {'loss':>8}  {'ΔL':>10}")
@@ -296,7 +307,10 @@ def main(cfg: DictConfig):
     plot_contour(batch_sizes, lrs, all_losses, step, cfg.optimizer, cfg.run_dir)
     plot_fits(batch_sizes, eps_opts, grad_norm_sqs, B_noise, B_simple, step, cfg.optimizer, cfg.run_dir)
 
-    ray.shutdown()
+    for _ in workers:
+        task_queue.put(None)
+    for p in workers:
+        p.join()
     print0("\nDone.")
 
 

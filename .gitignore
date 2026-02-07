@@ -17,3 +17,4 @@ workspace/
 *.png
 *.csv
 *.log
+.cache/
