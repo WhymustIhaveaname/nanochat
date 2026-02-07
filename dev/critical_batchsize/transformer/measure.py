@@ -64,15 +64,44 @@ def _init_optimizer_state(optimizer, optimizer_type):
         return
 
     if optimizer_type == "adamw":
-        for group in optimizer.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                state = optimizer.state[p]
-                g = p.grad.to(dtype=p.dtype)
-                state["exp_avg"] = g.clone()
-                state["exp_avg_sq"] = g**2
-                state["step"] = torch.tensor(0)
+        # AdamW 默认 state (exp_avg=0, exp_avg_sq=0, step=0) 第一步等价于稳态，无需初始化
+        # for group in optimizer.param_groups:
+        #     for p in group["params"]:
+        #         if p.grad is None:
+        #             continue
+        #         state = optimizer.state[p]
+        #         g = p.grad.to(dtype=p.dtype)
+        #         state["exp_avg"] = g.clone()
+        #         state["exp_avg_sq"] = g**2
+        #         state["step"] = torch.tensor(10000)
+        p = next(p for group in optimizer.param_groups for p in group["params"] if p.grad is not None)
+        assert optimizer.state[p] == {}, f"Expected empty state, got {optimizer.state[p]}"
+        return
+
+    raise ValueError(f"Unsupported optimizer: {optimizer_type}")
+
+
+def _check_optimizer_state(optimizer, optimizer_type, n=4):
+    if optimizer_type == "adamw":
+        group = optimizer.param_groups[-1]
+        beta1, beta2 = group["betas"]
+        p = next(p for p in reversed(group["params"]) if p.grad is not None)
+        s = optimizer.state[p]
+        g = p.grad.flatten()[:n]
+        # print(
+        #     f"  [check] grad={g.tolist()}"
+        #     f"  grad²={(g**2).tolist()}"
+        #     f"  exp_avg={s['exp_avg'].flatten()[:n].tolist()}"
+        #     f"  exp_avg_sq={s['exp_avg_sq'].flatten()[:n].tolist()}"
+        #     f"  step={s['step']}"
+        # )
+        assert s["step"] == 1
+        assert torch.allclose(s["exp_avg"].flatten()[:n], g * (1 - beta1), atol=1e-7)
+        assert torch.allclose(s["exp_avg_sq"].flatten()[:n], g**2 * (1 - beta2), atol=1e-7)
+    elif optimizer_type == "sgd":
+        pass
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer_type}")
 
 
 @ray.remote(num_gpus=1)
@@ -85,10 +114,10 @@ class EvalWorker:
         self.optimizer_type = optimizer_type
 
         # Move eval batches to GPU (eval_batches_cpu is already deserialized by Ray)
-        self.eval_batches = [(x.to(self.device), y.to(self.device)) for x, y in eval_batches_cpu]
+        self.eval_batches = [(x.to(self.device), y.to(self.device), n) for x, y, n in eval_batches_cpu]
         self.autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    def eval_after_step(self, ckpt_state_cpu, grads_cpu, lr):
+    def step_and_eval(self, ckpt_state_cpu, grads_cpu, lr):
         ckpt_state = {k: v.to(self.device) for k, v in ckpt_state_cpu.items()}
         self.model.load_state_dict(ckpt_state)
         self.model.train()
@@ -100,12 +129,12 @@ class EvalWorker:
         optimizer = _build_optimizer(self.optimizer_type, self.trainable_params, lr)
         _init_optimizer_state(optimizer, self.optimizer_type)
         optimizer.step()
+        _check_optimizer_state(optimizer, self.optimizer_type)
 
         self.model.eval()
         total_loss, total_tokens = 0.0, 0
         with torch.no_grad(), self.autocast_ctx:
-            for x, y in self.eval_batches:
-                num_tokens = (y >= 0).sum().item()
+            for x, y, num_tokens in self.eval_batches:
                 total_loss += self.model(x, y).item() * num_tokens
                 total_tokens += num_tokens
         return total_loss / total_tokens
@@ -129,24 +158,23 @@ def compute_gradient(model, loader, batch_size, seq_len, autocast_ctx):
             loss = model(x, y)
         (loss * seq_len / batch_size).backward()
 
-    grad_norm_sq = sum((p.grad**2).sum().item() for p in model.parameters() if p.grad is not None)
-    grads = {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
-    return grads, grad_norm_sq
+    return {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
 
 
 def cache_eval_batches(loader, max_tokens):
-    """Cache eval batches for consistent evaluation across all LR sweeps."""
+    """Cache eval batches on CPU for consistent evaluation across all LR sweeps."""
     batches = []
     total_tokens = 0
     for x, y in loader:
-        batches.append((x.clone(), y.clone()))
-        total_tokens += (y >= 0).sum().item()
+        num_tokens = (y >= 0).sum().item()
+        batches.append((x.cpu(), y.cpu(), num_tokens))
+        total_tokens += num_tokens
         if total_tokens >= max_tokens:
             break
     return batches
 
 
-def find_optimal_lr(lrs, losses):
+def fit_quadratic(lrs, losses):
     A = np.vstack([np.ones_like(lrs), lrs, lrs**2]).T
     coeffs, _, _, _ = np.linalg.lstsq(A, np.array(losses), rcond=None)
     c, a, b = coeffs
@@ -164,96 +192,6 @@ def fit_linear(x, y):
     ss_res = np.sum((y - y_pred) ** 2)
     ss_tot = np.sum((y - np.mean(y)) ** 2)
     return b / a, 1 - ss_res / ss_tot
-
-
-def plot_lr_fits(batch_sizes, lrs, all_losses, all_coeffs, eps_opts, step, optimizer, out_dir):
-    n_batch = len(batch_sizes)
-    cols = min(3, n_batch)
-    rows = (n_batch + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
-
-    lr_fine = np.linspace(lrs.min(), lrs.max(), 100)
-    for i, B in enumerate(batch_sizes):
-        ax = axes[i // cols, i % cols]
-        c, a, b = all_coeffs[i]
-        y_fit = c + a * lr_fine + b * lr_fine**2
-
-        ax.scatter(lrs, all_losses[i], color="tab:blue", s=40, zorder=3)
-        ax.plot(lr_fine, y_fit, "r-", linewidth=2)
-        ax.axvline(eps_opts[i], color="green", linestyle="--", label=f"ε_opt={eps_opts[i]:.4f}")
-        ax.set_xlabel("Learning Rate")
-        ax.set_ylabel("Loss")
-        ax.set_title(f"B={B}")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-    for i in range(n_batch, rows * cols):
-        axes[i // cols, i % cols].axis("off")
-
-    fig.suptitle(f"LR Sweep Fits (Step {step}, {optimizer})", fontsize=14)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, f"step_{step:05d}_{optimizer}_lr_fits.png"), dpi=150)
-    plt.close(fig)
-
-
-def plot_contour(batch_sizes, lrs, losses, step, optimizer, out_dir):
-    fig, ax = plt.subplots(figsize=(8, 6))
-    B_grid, lr_grid = np.meshgrid(batch_sizes, lrs)
-    contour = ax.contourf(B_grid, lr_grid, losses.T, levels=20, cmap="viridis")
-    fig.colorbar(contour, ax=ax, label="Loss")
-    ax.set_xlabel("Batch Size")
-    ax.set_ylabel("Learning Rate")
-    ax.set_title(f"Loss Contour (Step {step}, {optimizer})")
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, f"step_{step:05d}_{optimizer}_contour.png"), dpi=150)
-    plt.close(fig)
-
-
-def plot_fits(batch_sizes, eps_opts, grad_norm_sqs, B_noise, B_simple, step, optimizer, out_dir):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    inv_B = 1.0 / np.array(batch_sizes)
-    inv_B_line = np.linspace(inv_B.min() * 0.8, inv_B.max() * 1.2, 100)
-
-    # B_noise fit: 1/ε = a + b/B, B_noise = b/a
-    inv_eps = 1.0 / np.array(eps_opts)
-    axes[0].scatter(inv_B, inv_eps, color="tab:blue", s=50, zorder=3)
-    a, b = np.linalg.lstsq(np.vstack([np.ones_like(inv_B), inv_B]).T, inv_eps, rcond=None)[0]
-    axes[0].plot(inv_B_line, a + b * inv_B_line, "r-", linewidth=2)
-    axes[0].set_xlabel("1/B")
-    axes[0].set_ylabel("1/ε_opt")
-    axes[0].text(
-        0.05,
-        0.95,
-        f"$1/\\epsilon = {a:.2f} + {b:.0f}/B$",
-        transform=axes[0].transAxes,
-        fontsize=10,
-        verticalalignment="top",
-    )
-    axes[0].set_title(f"$B_{{noise}}$ = {B_noise:.0f}")
-    axes[0].grid(True, alpha=0.3)
-
-    # B_simple fit: |g|² = a + b/B, B_simple = b/a
-    g_sq = np.array(grad_norm_sqs)
-    axes[1].scatter(inv_B, g_sq, color="tab:green", s=50, zorder=3)
-    a2, b2 = np.linalg.lstsq(np.vstack([np.ones_like(inv_B), inv_B]).T, g_sq, rcond=None)[0]
-    axes[1].plot(inv_B_line, a2 + b2 * inv_B_line, "r-", linewidth=2)
-    axes[1].set_xlabel("1/B")
-    axes[1].set_ylabel("$|g|^2$")
-    axes[1].text(
-        0.05,
-        0.95,
-        f"$|g|^2 = {a2:.2e} + {b2:.2e}/B$",
-        transform=axes[1].transAxes,
-        fontsize=10,
-        verticalalignment="top",
-    )
-    axes[1].set_title(f"$B_{{simple}}$ = {B_simple:.0f}")
-    axes[1].grid(True, alpha=0.3)
-
-    fig.suptitle(f"Step {step} ({optimizer})", fontsize=14)
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, f"step_{step:05d}_{optimizer}_fit.png"), dpi=150)
-    plt.close(fig)
 
 
 @hydra.main(config_path=".", config_name="measure_config", version_base=None)
@@ -291,12 +229,9 @@ def main(cfg: DictConfig):
     print0(f"Cached {len(eval_batches)} eval batches ({max_eval_tokens} tokens)")
 
     ray.init(ignore_reinit_error=True)
-    eval_batches_cpu = [(x.cpu(), y.cpu()) for x, y in eval_batches]
     run_cfg_dict = OmegaConf.to_container(run_cfg)
     num_workers = torch.cuda.device_count()
-    workers = [
-        EvalWorker.remote(run_cfg_dict, vocab_size, eval_batches_cpu, cfg.optimizer) for _ in range(num_workers)
-    ]
+    workers = [EvalWorker.remote(run_cfg_dict, vocab_size, eval_batches, cfg.optimizer) for _ in range(num_workers)]
     print0(f"Created {num_workers} Ray workers")
 
     lrs = np.linspace(cfg.lr_min, cfg.lr_max, cfg.lr_steps)
@@ -316,14 +251,15 @@ def main(cfg: DictConfig):
         print0(f"\n  [B={B}] Computing gradient...")
         model.load_state_dict(ckpt_state)
         model.train()
-        grads, grad_norm_sq = compute_gradient(model, heldout_loader, B, run_cfg.seq_len, autocast_ctx)
+        grads = compute_gradient(model, heldout_loader, B, run_cfg.seq_len, autocast_ctx)
+        grad_norm_sq = sum((p.grad**2).sum().item() for p in model.parameters() if p.grad is not None)
         grad_norm_sqs.append(grad_norm_sq)
         print0(f"  [B={B}] |g|² = {grad_norm_sq:.6e}")
 
         grads_ref = ray.put({k: v.cpu() for k, v in grads.items()})
         tasks = []
         for lr_idx, lr in enumerate(lrs):
-            tasks.append(workers[lr_idx % len(workers)].eval_after_step.remote(ckpt_state_ref, grads_ref, float(lr)))
+            tasks.append(workers[lr_idx % len(workers)].step_and_eval.remote(ckpt_state_ref, grads_ref, float(lr)))
 
         losses_for_B = ray.get(tasks)
         all_losses[b_idx] = losses_for_B
@@ -332,7 +268,7 @@ def main(cfg: DictConfig):
         for lr_idx, lr in enumerate(lrs):
             print0(f"    {lr:>8.4f}  {losses_for_B[lr_idx]:>8.4f}  {losses_for_B[lr_idx] - baseline_loss:>+10.4f}")
 
-        eps_opt, r2, coeffs = find_optimal_lr(lrs, losses_for_B)
+        eps_opt, r2, coeffs = fit_quadratic(lrs, losses_for_B)
         eps_opts.append(eps_opt)
         all_coeffs.append(coeffs)
         c, a, b = coeffs
@@ -362,6 +298,107 @@ def main(cfg: DictConfig):
 
     ray.shutdown()
     print0("\nDone.")
+
+
+########## Plotting functions ##########
+
+
+def plot_lr_fits(batch_sizes, lrs, all_losses, all_coeffs, eps_opts, step, optimizer, out_dir):
+    n_batch = len(batch_sizes)
+    cols = min(3, n_batch)
+    rows = (n_batch + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
+
+    lr_fine = np.linspace(lrs.min(), lrs.max(), 100)
+    for i, B in enumerate(batch_sizes):
+        ax = axes[i // cols, i % cols]
+        c, a, b = all_coeffs[i]
+        y_fit = c + a * lr_fine + b * lr_fine**2
+
+        ax.scatter(lrs, all_losses[i], color="tab:blue", s=40, zorder=3)
+        ax.plot(lr_fine, y_fit, "r-", linewidth=2)
+        ax.axvline(eps_opts[i], color="green", linestyle="--", label=f"ε_opt={eps_opts[i]:.4f}")
+        ax.set_xlabel("Learning Rate")
+        ax.set_ylabel("Loss")
+        ax.set_title(f"B={B}")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    for i in range(n_batch, rows * cols):
+        axes[i // cols, i % cols].axis("off")
+
+    fig.suptitle(f"LR Sweep Fits (Step {step}, {optimizer})", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"step_{step:05d}_{optimizer}_lr_fits.png"), dpi=300)
+    plt.close(fig)
+
+
+def plot_contour(batch_sizes, lrs, losses, step, optimizer, out_dir):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    B_grid, lr_grid = np.meshgrid(batch_sizes, lrs)
+    contour = ax.contourf(B_grid, lr_grid, losses.T, levels=20, cmap="viridis")
+    fig.colorbar(contour, ax=ax, label="Loss")
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel("Learning Rate")
+    ax.set_title(f"Loss Contour (Step {step}, {optimizer})")
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"step_{step:05d}_{optimizer}_contour.png"), dpi=300)
+    plt.close(fig)
+
+
+def plot_fits(batch_sizes, eps_opts, grad_norm_sqs, B_noise, B_simple, step, optimizer, out_dir):
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    B_arr = np.array(batch_sizes)
+    inv_B = 1.0 / B_arr
+    inv_B_line = np.linspace(inv_B.min() * 0.8, inv_B.max() * 1.2, 100)
+
+    # ε_opt vs B (raw data, no fit)
+    axes[0].plot(B_arr, eps_opts, "o-", color="tab:blue", markersize=6)
+    axes[0].set_xlabel("B")
+    axes[0].set_ylabel("$\\epsilon_{opt}$")
+    axes[0].set_title("$\\epsilon_{opt}$ vs B")
+    axes[0].grid(True, alpha=0.3)
+
+    # B_noise fit: 1/ε = a + b/B → (1/a)/ε = 1 + (b/a)/B
+    inv_eps = 1.0 / np.array(eps_opts)
+    axes[1].scatter(inv_B, inv_eps, color="tab:blue", s=50, zorder=3)
+    a, b = np.linalg.lstsq(np.vstack([np.ones_like(inv_B), inv_B]).T, inv_eps, rcond=None)[0]
+    axes[1].plot(inv_B_line, a + b * inv_B_line, "r-", linewidth=2)
+    axes[1].set_xlabel("1/B")
+    axes[1].set_ylabel("1/ε_opt")
+    axes[1].text(
+        0.05,
+        0.95,
+        f"${1 / a:.2g}/\\epsilon = 1 + {b / a:.2g}/B$",
+        transform=axes[1].transAxes,
+        fontsize=10,
+        verticalalignment="top",
+    )
+    axes[1].set_title(f"$B_{{noise}}$ = {B_noise:.0f}")
+    axes[1].grid(True, alpha=0.3)
+
+    # B_simple fit: |g|² = a2 + b2/B → |g|²/a2 = 1 + (b2/a2)/B
+    g_sq = np.array(grad_norm_sqs)
+    axes[2].scatter(inv_B, g_sq, color="tab:green", s=50, zorder=3)
+    a2, b2 = np.linalg.lstsq(np.vstack([np.ones_like(inv_B), inv_B]).T, g_sq, rcond=None)[0]
+    axes[2].plot(inv_B_line, a2 + b2 * inv_B_line, "r-", linewidth=2)
+    axes[2].set_xlabel("1/B")
+    axes[2].set_ylabel("$|g|^2$")
+    axes[2].text(
+        0.05,
+        0.95,
+        f"$|g|^2/{a2:.2g} = 1 + {b2 / a2:.2g}/B$",
+        transform=axes[2].transAxes,
+        fontsize=10,
+        verticalalignment="top",
+    )
+    axes[2].set_title(f"$B_{{simple}}$ = {B_simple:.0f}")
+    axes[2].grid(True, alpha=0.3)
+
+    fig.suptitle(f"Step {step} ({optimizer})", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, f"step_{step:05d}_{optimizer}_fit.png"), dpi=300)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
