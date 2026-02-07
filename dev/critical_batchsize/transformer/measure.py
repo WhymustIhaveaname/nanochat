@@ -9,7 +9,6 @@ Usage:
 import csv
 import os
 from contextlib import nullcontext
-from dataclasses import dataclass
 
 import hydra
 import matplotlib.pyplot as plt
@@ -25,18 +24,11 @@ from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 
 
-# =============================================================================
-# Ray Actor for parallel evaluation
-# =============================================================================
-
-
-def _build_model_on_device(run_cfg_dict, device):
-    """Build model on specified device (shared logic for main process and workers)."""
-    tokenizer = get_tokenizer()
+def build_model(run_cfg_dict, vocab_size, device):
     run_cfg = OmegaConf.create(run_cfg_dict) if isinstance(run_cfg_dict, dict) else run_cfg_dict
     model_config = GPTConfig(
         sequence_len=run_cfg.seq_len,
-        vocab_size=tokenizer.get_vocab_size(),
+        vocab_size=vocab_size,
         n_layer=run_cfg.depth,
         n_head=run_cfg.depth,
         n_kv_head=run_cfg.depth,
@@ -58,7 +50,6 @@ def _build_model_on_device(run_cfg_dict, device):
 
 
 def _build_optimizer(optimizer_type, params, lr):
-    """Build optimizer (shared logic)."""
     if optimizer_type == "sgd":
         return torch.optim.SGD(params, lr=lr, momentum=0)
     if optimizer_type == "adamw":
@@ -67,7 +58,6 @@ def _build_optimizer(optimizer_type, params, lr):
 
 
 def _init_optimizer_state(optimizer, optimizer_type):
-    """Initialize optimizer state (shared logic)."""
     if optimizer_type == "sgd":
         for group in optimizer.param_groups:
             assert group["momentum"] == 0, "SGD must have momentum=0"
@@ -89,9 +79,9 @@ def _init_optimizer_state(optimizer, optimizer_type):
 class EvalWorker:
     """Ray actor for parallel evaluation. Each worker holds a model copy on its GPU."""
 
-    def __init__(self, run_cfg_dict, eval_batches_cpu, optimizer_type):
+    def __init__(self, run_cfg_dict, vocab_size, eval_batches_cpu, optimizer_type):
         self.device = torch.device("cuda")
-        self.model, self.trainable_params = _build_model_on_device(run_cfg_dict, self.device)
+        self.model, self.trainable_params = build_model(run_cfg_dict, vocab_size, self.device)
         self.optimizer_type = optimizer_type
 
         # Move eval batches to GPU (eval_batches_cpu is already deserialized by Ray)
@@ -99,33 +89,18 @@ class EvalWorker:
         self.autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     def eval_after_step(self, ckpt_state_cpu, grads_cpu, lr):
-        """Load checkpoint, apply gradients, take optimizer step, and evaluate.
-
-        Args:
-            ckpt_state_cpu: checkpoint state dict (CPU tensors, auto-resolved by Ray)
-            grads_cpu: gradients dict (CPU tensors, auto-resolved by Ray)
-            lr: learning rate for this evaluation
-
-        Returns:
-            eval_loss: float
-        """
-
-        # Load checkpoint to GPU
         ckpt_state = {k: v.to(self.device) for k, v in ckpt_state_cpu.items()}
         self.model.load_state_dict(ckpt_state)
         self.model.train()
 
-        # Restore gradients
         for n, p in self.model.named_parameters():
             if n in grads_cpu:
                 p.grad = grads_cpu[n].to(device=self.device, dtype=p.dtype)
 
-        # Create optimizer, init state, and step
         optimizer = _build_optimizer(self.optimizer_type, self.trainable_params, lr)
         _init_optimizer_state(optimizer, self.optimizer_type)
         optimizer.step()
 
-        # Eval
         self.model.eval()
         total_loss, total_tokens = 0.0, 0
         with torch.no_grad(), self.autocast_ctx:
@@ -136,31 +111,6 @@ class EvalWorker:
         return total_loss / total_tokens
 
 
-# =============================================================================
-# Data classes and builders
-# =============================================================================
-
-
-@dataclass
-class MeasureContext:
-    model: any
-    trainable_params: list
-    heldout_loader: any
-    autocast_ctx: any
-    run_cfg: any
-    run_cfg_dict: dict  # for passing to workers
-    cfg: any
-    lrs: np.ndarray
-    batch_sizes: list
-    workers: list  # Ray actors
-
-
-def build_model(run_cfg, device):
-    model, trainable_params = _build_model_on_device(run_cfg, device)
-    tokenizer = get_tokenizer()
-    return model, trainable_params, tokenizer
-
-
 def build_data(tokenizer, run_cfg, device):
     heldout_loader = tokenizing_distributed_data_loader_bos_bestfit(
         tokenizer, 1, run_cfg.seq_len, split="heldout", device=device
@@ -169,16 +119,6 @@ def build_data(tokenizer, run_cfg, device):
         tokenizer, 1, run_cfg.eval_seq_len, split="val", device=device
     )
     return heldout_loader, val_loader
-
-
-# Keep old names as aliases for compatibility
-build_optimizer = _build_optimizer
-init_optimizer_state = _init_optimizer_state
-
-
-# =============================================================================
-# Core computation
-# =============================================================================
 
 
 def compute_gradient(model, loader, batch_size, seq_len, autocast_ctx):
@@ -224,67 +164,6 @@ def fit_linear(x, y):
     ss_res = np.sum((y - y_pred) ** 2)
     ss_tot = np.sum((y - np.mean(y)) ** 2)
     return b / a, 1 - ss_res / ss_tot
-
-
-def process_checkpoint_parallel(ctx, ckpt_state, step, baseline_loss, out_dir):
-    """Process checkpoint with parallel evaluation using Ray workers."""
-    batch_sizes = ctx.batch_sizes
-    lrs = ctx.lrs
-
-    # Put checkpoint state in Ray object store (once, shared by all workers)
-    ckpt_state_cpu = {k: v.cpu() for k, v in ckpt_state.items()}
-    ckpt_state_ref = ray.put(ckpt_state_cpu)
-
-    eps_opts = []
-    all_coeffs = []
-    all_grad_norm_sqs = []
-    all_losses = np.zeros((len(batch_sizes), len(lrs)))
-
-    # Process each batch_size: compute gradient, parallel eval all lrs, then print
-    for b_idx, B in enumerate(batch_sizes):
-        # Step 1: Compute gradient for this B
-        print0(f"\n  [B={B}] Computing gradient...")
-        ctx.model.load_state_dict(ckpt_state)
-        ctx.model.train()
-        grads, grad_norm_sq = compute_gradient(
-            ctx.model, ctx.heldout_loader, B, ctx.run_cfg.seq_len, ctx.autocast_ctx
-        )
-        all_grad_norm_sqs.append(grad_norm_sq)
-        print0(f"  [B={B}] |g|² = {grad_norm_sq:.6e}")
-
-        # Step 2: Submit all lr tasks for this B in parallel
-        grads_cpu = {k: v.cpu() for k, v in grads.items()}
-        grads_ref = ray.put(grads_cpu)
-
-        tasks = []
-        for lr_idx, lr in enumerate(lrs):
-            worker_idx = lr_idx % len(ctx.workers)
-            task = ctx.workers[worker_idx].eval_after_step.remote(
-                ckpt_state_ref, grads_ref, float(lr)
-            )
-            tasks.append(task)
-
-        # Step 3: Wait for all lr evals to complete
-        losses_for_B = ray.get(tasks)
-        all_losses[b_idx] = losses_for_B
-
-        # Step 4: Print results for this B
-        print0(f"    {'lr':>8}  {'loss':>8}  {'ΔL':>10}")
-        for lr_idx, lr in enumerate(lrs):
-            loss = losses_for_B[lr_idx]
-            delta_loss = loss - baseline_loss
-            print0(f"    {lr:>8.4f}  {loss:>8.4f}  {delta_loss:>+10.4f}")
-
-        # Step 5: Fit and print for this B
-        eps_opt, r2, coeffs = find_optimal_lr(lrs, losses_for_B)
-        eps_opts.append(eps_opt)
-        all_coeffs.append(coeffs)
-        c, a, b = coeffs
-        print0(f"  [B={B}] Fit: L(ε) = {c:.4f} + {a:.4f}*ε + {b:.4f}*ε²")
-        print0(f"  [B={B}] ε_opt = {eps_opt:.4f}, R² = {r2:.4f}")
-
-    plot_lr_fits(batch_sizes, lrs, all_losses, all_coeffs, eps_opts, step, ctx.cfg.optimizer, out_dir)
-    return eps_opts, all_grad_norm_sqs, all_losses
 
 
 def plot_lr_fits(batch_sizes, lrs, all_losses, all_coeffs, eps_opts, step, optimizer, out_dir):
@@ -388,7 +267,6 @@ def main(cfg: DictConfig):
     run_cfg = OmegaConf.load(os.path.join(cfg.run_dir, "config.yaml"))
     print0(f"Run dir: {cfg.run_dir}, depth: {run_cfg.depth}, seq_len: {run_cfg.seq_len}")
 
-    # Load baseline loss for the target step
     step = cfg.step
     baseline_loss = None
     with open(os.path.join(cfg.run_dir, "loss_eval.csv")) as f:
@@ -401,7 +279,9 @@ def main(cfg: DictConfig):
     ckpt_path = os.path.join(cfg.run_dir, "checkpoints", f"step_{step:05d}.pt")
     print0(f"Step {step} | Baseline loss: {baseline_loss:.4f} | Checkpoint: {ckpt_path}")
 
-    model, trainable_params, tokenizer = build_model(run_cfg, device)
+    tokenizer = get_tokenizer()
+    vocab_size = tokenizer.get_vocab_size()
+    model, trainable_params = build_model(run_cfg, vocab_size, device)
     print0(f"Trainable params: {sum(p.numel() for p in trainable_params):,}")
 
     heldout_loader, val_loader = build_data(tokenizer, run_cfg, device)
@@ -410,45 +290,57 @@ def main(cfg: DictConfig):
     eval_batches = cache_eval_batches(val_loader, max_eval_tokens)
     print0(f"Cached {len(eval_batches)} eval batches ({max_eval_tokens} tokens)")
 
-    # Initialize Ray and create workers
     ray.init(ignore_reinit_error=True)
     eval_batches_cpu = [(x.cpu(), y.cpu()) for x, y in eval_batches]
     run_cfg_dict = OmegaConf.to_container(run_cfg)
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    num_workers = getattr(cfg, "num_workers", num_gpus)
+    num_workers = torch.cuda.device_count()
     workers = [
-        EvalWorker.remote(run_cfg_dict, eval_batches_cpu, cfg.optimizer)
-        for _ in range(num_workers)
+        EvalWorker.remote(run_cfg_dict, vocab_size, eval_batches_cpu, cfg.optimizer) for _ in range(num_workers)
     ]
-    print0(f"Created {num_workers} Ray workers for parallel eval ({num_gpus} GPUs detected)")
+    print0(f"Created {num_workers} Ray workers")
 
     lrs = np.linspace(cfg.lr_min, cfg.lr_max, cfg.lr_steps)
     batch_sizes = list(cfg.batch_sizes)
-    lr_str = ", ".join(f"{lr:.4f}" for lr in lrs)
     print0(f"Batch sizes: {batch_sizes}")
-    print0(f"LRs: [{lr_str}]")
-
-    out_dir = cfg.run_dir
-
-    ctx = MeasureContext(
-        model=model,
-        trainable_params=trainable_params,
-        heldout_loader=heldout_loader,
-        autocast_ctx=autocast_ctx,
-        run_cfg=run_cfg,
-        run_cfg_dict=run_cfg_dict,
-        cfg=cfg,
-        lrs=lrs,
-        batch_sizes=batch_sizes,
-        workers=workers,
-    )
+    print0(f"LRs: [{', '.join(f'{lr:.4f}' for lr in lrs)}]")
 
     ckpt_state = torch.load(ckpt_path, map_location=device, weights_only=True)
-    eps_opts, grad_norm_sqs, all_losses = process_checkpoint_parallel(
-        ctx, ckpt_state, step, baseline_loss, out_dir
-    )
+    ckpt_state_ref = ray.put({k: v.cpu() for k, v in ckpt_state.items()})
 
-    # Final fitting
+    eps_opts = []
+    all_coeffs = []
+    grad_norm_sqs = []
+    all_losses = np.zeros((len(batch_sizes), len(lrs)))
+
+    for b_idx, B in enumerate(batch_sizes):
+        print0(f"\n  [B={B}] Computing gradient...")
+        model.load_state_dict(ckpt_state)
+        model.train()
+        grads, grad_norm_sq = compute_gradient(model, heldout_loader, B, run_cfg.seq_len, autocast_ctx)
+        grad_norm_sqs.append(grad_norm_sq)
+        print0(f"  [B={B}] |g|² = {grad_norm_sq:.6e}")
+
+        grads_ref = ray.put({k: v.cpu() for k, v in grads.items()})
+        tasks = []
+        for lr_idx, lr in enumerate(lrs):
+            tasks.append(workers[lr_idx % len(workers)].eval_after_step.remote(ckpt_state_ref, grads_ref, float(lr)))
+
+        losses_for_B = ray.get(tasks)
+        all_losses[b_idx] = losses_for_B
+
+        print0(f"    {'lr':>8}  {'loss':>8}  {'ΔL':>10}")
+        for lr_idx, lr in enumerate(lrs):
+            print0(f"    {lr:>8.4f}  {losses_for_B[lr_idx]:>8.4f}  {losses_for_B[lr_idx] - baseline_loss:>+10.4f}")
+
+        eps_opt, r2, coeffs = find_optimal_lr(lrs, losses_for_B)
+        eps_opts.append(eps_opt)
+        all_coeffs.append(coeffs)
+        c, a, b = coeffs
+        print0(f"  [B={B}] Fit: L(ε) = {c:.4f} + {a:.4f}*ε + {b:.4f}*ε²")
+        print0(f"  [B={B}] ε_opt = {eps_opt:.4f}, R² = {r2:.4f}")
+
+    plot_lr_fits(batch_sizes, lrs, all_losses, all_coeffs, eps_opts, step, cfg.optimizer, cfg.run_dir)
+
     inv_B = 1.0 / np.array(batch_sizes)
     inv_eps = 1.0 / np.array(eps_opts)
     B_noise, B_noise_r2 = fit_linear(inv_B, inv_eps)
@@ -465,8 +357,8 @@ def main(cfg: DictConfig):
         print0(f"    B={B:>6}  1/B={1 / B:.2e}  |g|²={g_sq:.6e}")
     print0(f"  => B_simple = {B_simple:.0f} (R² = {B_simple_r2:.4f})")
 
-    plot_contour(batch_sizes, lrs, all_losses, step, cfg.optimizer, out_dir)
-    plot_fits(batch_sizes, eps_opts, grad_norm_sqs, B_noise, B_simple, step, cfg.optimizer, out_dir)
+    plot_contour(batch_sizes, lrs, all_losses, step, cfg.optimizer, cfg.run_dir)
+    plot_fits(batch_sizes, eps_opts, grad_norm_sqs, B_noise, B_simple, step, cfg.optimizer, cfg.run_dir)
 
     ray.shutdown()
     print0("\nDone.")

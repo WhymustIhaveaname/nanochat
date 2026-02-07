@@ -24,6 +24,7 @@ dev/critical_batchsize/
 ├── transformer/               # Transformer 语言模型实验
 │   ├── train.py               # Phase 1: 训练 + 记录 loss + 保存 checkpoint
 │   ├── measure.py             # Phase 2: 测 B_noise + B_simple
+│   ├── measure.log            # measure.py 的参考输出（用于回归对比）
 │   └── outputs/               # 输出目录 (日期_depth_optimizer_batchsize)
 │
 ├── cnn/                       # CNN 图片分类实验（结构同 transformer/）
@@ -34,3 +35,21 @@ dev/critical_batchsize/
     ├── fit_bsimple.py
     └── *.png / *.csv          # 分析结果直接堆这里
 ```
+
+---
+
+## measure.py 参考输出
+
+运行配置：`run_dir=02-02_d4_adamw_8192`, `step=3072`, `optimizer=sgd`, `batch_sizes=[8192,16384,32768,65536]`, `lr=[0,2,4,6,8,10]`, `max_eval_tokens=null`(16M)
+
+```
+B=  8192  |g|²=9.959494e-03  ε_opt=2.0485
+B= 16384  |g|²=2.829672e-03  ε_opt=4.0057
+B= 32768  |g|²=7.497375e-03  ε_opt=2.1593
+B= 65536  |g|²=4.936834e-03  ε_opt=2.0444
+
+B_noise  = -99   (R² = 0.0003)
+B_simple = 8921  (R² = 0.3232)
+```
+
+完整日志见 `transformer/measure.log`。
